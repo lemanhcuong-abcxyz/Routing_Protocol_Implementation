@@ -1,4 +1,3 @@
-"""Distance-vector routing implementation for the Harvard CS145 simulator."""
 import json
 from router import Router
 from packet import Packet
