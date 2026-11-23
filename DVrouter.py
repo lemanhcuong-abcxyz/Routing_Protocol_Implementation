@@ -8,8 +8,8 @@ class DVrouter(Router):
         Router.__init__(self, addr)
         self.heartbeat_time = heartbeat_time
         self.last_time = 0
-        self.ports = {}             # port -> (neighbor address, link cost)
-        self.neighbor_vectors = {}  # neighbor -> {destination: cost}
+        self.ports = {}
+        self.neighbor_vectors = {}
         self.distance = {addr: 0}
         self.next_hop = {}
         self.infinity = 16
@@ -17,7 +17,6 @@ class DVrouter(Router):
     def _recompute(self):
         dist = {self.addr: 0}
         hop = {}
-        # Direct links are known independently of neighbor advertisements.
         for port, (neighbor, cost) in self.ports.items():
             if cost < dist.get(neighbor, self.infinity):
                 dist[neighbor] = cost
@@ -39,7 +38,6 @@ class DVrouter(Router):
         return {neighbor: (port, cost) for port, (neighbor, cost) in self.ports.items()}
 
     def _advertisement(self, outgoing_neighbor=None):
-        # Poison reverse: routes learned through this neighbor are advertised as unreachable.
         vector = {}
         for destination, cost in self.distance.items():
             if destination == self.addr:
