@@ -1,8 +1,8 @@
-"""Link-state routing implementation for the Harvard CS145 simulator."""
-import json
 import heapq
-from router import Router
+import json
+
 from packet import Packet
+from router import Router
 
 
 class LSrouter(Router):
@@ -10,92 +10,105 @@ class LSrouter(Router):
         Router.__init__(self, addr)
         self.heartbeat_time = heartbeat_time
         self.last_time = 0
-        self.ports = {}              # port -> (neighbor address, link cost)
-        self.database = {addr: {}}    # router address -> adjacency map
-        self.sequence = 0
-        self.sequences = {addr: 0}
-        self.next_hop = {}
+        self.neighbors = {}
+        self.seq = 0
+        self.lsdb = {self.addr: (self.seq, {})}
+        self.fwd = {}
 
-    def _own_state(self):
-        self.database[self.addr] = {neighbor: cost for _, (neighbor, cost) in self.ports.items()}
+    def _own_links(self):
+        return {nbr: cost for nbr, cost in self.neighbors.values()}
 
-    def _originate(self):
-        self.sequence += 1
-        self.sequences[self.addr] = self.sequence
-        self._own_state()
-        payload = json.dumps({"type": "ls", "origin": self.addr, "seq": self.sequence,
-                             "links": self.database[self.addr]})
-        for port, (neighbor, _) in list(self.ports.items()):
-            self.send(port, Packet(Packet.ROUTING, self.addr, neighbor, payload))
+    def _make_lsp(self):
+        content = json.dumps({
+            "origin": self.addr,
+            "seq": self.seq,
+            "links": self.lsdb[self.addr][1],
+        })
+        return content
 
-    def _compute_routes(self):
-        graph = {node: dict(edges) for node, edges in self.database.items()}
-        graph.setdefault(self.addr, {})
-        # Add local link state so current adjacency is authoritative.
-        graph[self.addr] = {neighbor: cost for _, (neighbor, cost) in self.ports.items()}
-        distances = {self.addr: 0}
-        first_port = {}
-        queue = [(0, self.addr, None)]
+    def _flood(self, content, except_port=None):
+        for port, (nbr, _) in self.neighbors.items():
+            if port == except_port:
+                continue
+            self.send(port, Packet(Packet.ROUTING, self.addr, nbr, content))
+
+    def _update_own_state(self):
+        self.seq += 1
+        self.lsdb[self.addr] = (self.seq, self._own_links())
+        self._dijkstra()
+        self._flood(self._make_lsp())
+
+    def _dijkstra(self):
+        graph = {}
+        for origin, (_, links) in self.lsdb.items():
+            for nbr, cost in links.items():
+                if nbr in self.lsdb and origin not in self.lsdb[nbr][1]:
+                    continue
+                graph.setdefault(origin, {})[nbr] = cost
+
+        dist = {self.addr: 0}
+        first_hop = {}
+        heap = [(0, self.addr, None)]
         visited = set()
-        while queue:
-            cost_so_far, node, first = heapq.heappop(queue)
+
+        while heap:
+            d, node, hop = heapq.heappop(heap)
             if node in visited:
                 continue
             visited.add(node)
-            if node != self.addr and first is not None:
-                distances[node] = cost_so_far
-                first_port[node] = first
-            for neighbor, edge_cost in graph.get(node, {}).items():
-                if neighbor in visited:
-                    continue
-                new_cost = cost_so_far + edge_cost
-                new_first = neighbor if node == self.addr else first
-                if new_cost < distances.get(neighbor, float("inf")):
-                    distances[neighbor] = new_cost
-                    heapq.heappush(queue, (new_cost, neighbor, new_first))
-                    if node == self.addr:
-                        first_port[neighbor] = next((p for p, (n, _) in self.ports.items() if n == neighbor), None)
-        self.next_hop = {dest: port for dest, port in first_port.items() if port is not None}
+            if hop is not None:
+                first_hop[node] = hop
+            for nbr, cost in graph.get(node, {}).items():
+                nd = d + cost
+                if nbr not in dist or nd < dist[nbr]:
+                    dist[nbr] = nd
+                    heapq.heappush(heap, (nd, nbr, nbr if node == self.addr else hop))
+
+        port_of = {nbr: port for port, (nbr, _) in self.neighbors.items()}
+        self.fwd = {
+            dst: port_of[hop]
+            for dst, hop in first_hop.items()
+            if hop in port_of
+        }
 
     def handle_packet(self, port, packet):
         if packet.is_traceroute:
-            out_port = self.next_hop.get(packet.dst_addr)
+            out_port = self.fwd.get(packet.dst_addr)
             if out_port is not None:
                 self.send(out_port, packet)
             return
-        try:
-            data = json.loads(packet.content)
-            if data.get("type") != "ls":
-                return
-            origin = data["origin"]
-            seq = int(data["seq"])
-            if seq <= self.sequences.get(origin, -1):
-                return
-            self.sequences[origin] = seq
-            self.database[origin] = data.get("links", {})
-            self._compute_routes()
-            # Flood only to neighbors other than the incoming port.
-            for out_port, (neighbor, _) in list(self.ports.items()):
-                if out_port == port:
-                    continue
-                self.send(out_port, Packet(Packet.ROUTING, self.addr, neighbor, packet.content))
-        except (KeyError, TypeError, ValueError):
+
+        lsp = json.loads(packet.content)
+        origin, seq, links = lsp["origin"], lsp["seq"], lsp["links"]
+        if origin == self.addr:
             return
 
+        old = self.lsdb.get(origin)
+        if old is not None and seq <= old[0]:
+            return
+
+        self.lsdb[origin] = (seq, links)
+        if old is None or old[1] != links:
+            self._dijkstra()
+        self._flood(packet.content, except_port=port)
+
     def handle_new_link(self, port, endpoint, cost):
-        self.ports[port] = (endpoint, cost)
-        self._compute_routes()
-        self._originate()
+        self.neighbors[port] = (endpoint, cost)
+        self._update_own_state()
 
     def handle_remove_link(self, port):
-        self.ports.pop(port, None)
-        self._compute_routes()
-        self._originate()
+        if port not in self.neighbors:
+            return
+        self.neighbors.pop(port)
+        self._update_own_state()
 
     def handle_time(self, time_ms):
         if time_ms - self.last_time >= self.heartbeat_time:
             self.last_time = time_ms
-            self._originate()
+            self._flood(self._make_lsp())
 
     def __repr__(self):
-        return f"LSrouter(addr={self.addr}, next_hop={self.next_hop})"
+        rows = [f"LSrouter(addr={self.addr}, seq={self.seq})"]
+        for dst in sorted(self.fwd):
+            rows.append(f"  {dst}: port={self.fwd[dst]}")
+        return "\n".join(rows)
